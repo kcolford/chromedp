@@ -24,11 +24,18 @@ import (
 // These CDP commands are not sent by chromedp. If it does not work as expected,
 // you can try to send those commands yourself.
 //
-// See CaptureScreenshot for capturing a screenshot of the browser viewport.
+// See [CaptureScreenshot] for capturing a screenshot of the browser viewport.
 //
-// See the 'screenshot' example in the https://github.com/chromedp/examples
-// project for an example of taking a screenshot of the entire page.
-func Screenshot(sel interface{}, picbuf *[]byte, opts ...QueryOption) QueryAction {
+// See [screenshot] for an example of taking a screenshot of the entire page.
+//
+// [screenshot]: https://github.com/chromedp/examples/tree/master/screenshot
+func Screenshot(sel any, picbuf *[]byte, opts ...QueryOption) QueryAction {
+	return ScreenshotScale(sel, 1, picbuf, opts...)
+}
+
+// ScreenshotScale is like [Screenshot] but accepts a scale parameter that
+// specifies the page scale factor.
+func ScreenshotScale(sel any, scale float64, picbuf *[]byte, opts ...QueryOption) QueryAction {
 	if picbuf == nil {
 		panic("picbuf cannot be nil")
 	}
@@ -37,11 +44,38 @@ func Screenshot(sel interface{}, picbuf *[]byte, opts ...QueryOption) QueryActio
 		if len(nodes) < 1 {
 			return fmt.Errorf("selector %q did not return any nodes", sel)
 		}
+		return ScreenshotNodes(nodes, scale, picbuf).Do(ctx)
+	}, append(opts, NodeVisible)...)
+}
 
-		// get box model
+// ScreenshotNodes is an action that captures/takes a screenshot of the
+// specified nodes, by calculating the extents of the top most left node and
+// bottom most right node.
+func ScreenshotNodes(nodes []*cdp.Node, scale float64, picbuf *[]byte) Action {
+	if len(nodes) == 0 {
+		panic("nodes must be non-empty")
+	}
+	if picbuf == nil {
+		panic("picbuf cannot be nil")
+	}
+
+	return ActionFunc(func(ctx context.Context) error {
 		var clip page.Viewport
+
+		// get box model of first node
 		if err := callFunctionOnNode(ctx, nodes[0], getClientRectJS, &clip); err != nil {
 			return err
+		}
+
+		// remainder
+		for _, node := range nodes[1:] {
+			var v page.Viewport
+			// get box model of first node
+			if err := callFunctionOnNode(ctx, node, getClientRectJS, &v); err != nil {
+				return err
+			}
+			clip.X, clip.Width = extents(clip.X, clip.Width, v.X, v.Width)
+			clip.Y, clip.Height = extents(clip.Y, clip.Height, v.Y, v.Height)
 		}
 
 		// The "Capture node screenshot" command does not handle fractional dimensions properly.
@@ -51,14 +85,13 @@ func Screenshot(sel interface{}, picbuf *[]byte, opts ...QueryOption) QueryActio
 		clip.Width, clip.Height = math.Round(clip.Width+clip.X-x), math.Round(clip.Height+clip.Y-y)
 		clip.X, clip.Y = x, y
 
-		// The next comment is copied from the original code.
-		// This seems to be necessary? Seems to do the right thing regardless of DPI.
-		clip.Scale = 1
+		clip.Scale = scale
 
 		// take screenshot of the box
 		buf, err := page.CaptureScreenshot().
 			WithFormat(page.CaptureScreenshotFormatPng).
 			WithCaptureBeyondViewport(true).
+			WithFromSurface(true).
 			WithClip(&clip).
 			Do(ctx)
 		if err != nil {
@@ -67,7 +100,7 @@ func Screenshot(sel interface{}, picbuf *[]byte, opts ...QueryOption) QueryActio
 
 		*picbuf = buf
 		return nil
-	}, append(opts, NodeVisible)...)
+	})
 }
 
 // CaptureScreenshot is an action that captures/takes a screenshot of the
@@ -76,10 +109,11 @@ func Screenshot(sel interface{}, picbuf *[]byte, opts ...QueryOption) QueryActio
 // It's supposed to act the same as the command "Capture screenshot" in
 // Chrome. See the behavior notes of Screenshot for more information.
 //
-// See the Screenshot action to take a screenshot of a specific element.
+// See the [Screenshot] action to take a screenshot of a specific element.
 //
-// See the 'screenshot' example in the https://github.com/chromedp/examples
-// project for an example of taking a screenshot of the entire page.
+// See [screenshot] for an example of taking a screenshot of the entire page.
+//
+// [screenshot]: https://github.com/chromedp/examples/tree/master/screenshot
 func CaptureScreenshot(res *[]byte) Action {
 	if res == nil {
 		panic("res cannot be nil")
@@ -88,7 +122,7 @@ func CaptureScreenshot(res *[]byte) Action {
 	return ActionFunc(func(ctx context.Context) error {
 		var err error
 		*res, err = page.CaptureScreenshot().
-			WithCaptureBeyondViewport(true).
+			WithFromSurface(true).
 			Do(ctx)
 		return err
 	})
@@ -107,36 +141,28 @@ func FullScreenshot(res *[]byte, quality int) EmulateAction {
 		panic("res cannot be nil")
 	}
 	return ActionFunc(func(ctx context.Context) error {
-		// get layout metrics
-		_, _, contentSize, _, _, cssContentSize, err := page.GetLayoutMetrics().Do(ctx)
-		if err != nil {
-			return err
-		}
-		// protocol v90 changed the return parameter name (contentSize -> cssContentSize)
-		if cssContentSize != nil {
-			contentSize = cssContentSize
-		}
-
 		format := page.CaptureScreenshotFormatPng
 		if quality != 100 {
 			format = page.CaptureScreenshotFormatJpeg
 		}
 
 		// capture screenshot
+		var err error
 		*res, err = page.CaptureScreenshot().
 			WithCaptureBeyondViewport(true).
+			WithFromSurface(true).
 			WithFormat(format).
 			WithQuality(int64(quality)).
-			WithClip(&page.Viewport{
-				X:      0,
-				Y:      0,
-				Width:  contentSize.Width,
-				Height: contentSize.Height,
-				Scale:  1,
-			}).Do(ctx)
+			Do(ctx)
 		if err != nil {
 			return err
 		}
 		return nil
 	})
+}
+
+func extents(m, n, o, p float64) (float64, float64) {
+	a := min(m, o)
+	b := max(m+n, o+p)
+	return a, b - a
 }

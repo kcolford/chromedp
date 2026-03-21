@@ -3,15 +3,19 @@ package chromedp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"image/color"
+	"image/png"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +30,7 @@ import (
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/cdproto/target"
+	"github.com/ledongthuc/pdf"
 )
 
 var (
@@ -48,7 +53,7 @@ func init() {
 	}
 	testdataDir = "file://" + path.Join(wd, "testdata")
 
-	allocTempDir, err = ioutil.TempDir("", "chromedp-test")
+	allocTempDir, err = os.MkdirTemp("", "chromedp-test")
 	if err != nil {
 		panic(fmt.Sprintf("could not create temp directory: %v", err))
 	}
@@ -87,7 +92,7 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	cancel()
 
-	if infos, _ := ioutil.ReadDir(allocTempDir); len(infos) > 0 {
+	if infos, _ := os.ReadDir(allocTempDir); len(infos) > 0 {
 		os.RemoveAll(allocTempDir)
 		panic(fmt.Sprintf("leaked %d temporary dirs under %s", len(infos), allocTempDir))
 	} else {
@@ -112,7 +117,7 @@ func testAllocate(tb testing.TB, name string) (context.Context, context.CancelFu
 	// each test gives a huge speed-up.
 	ctx, _ := NewContext(browserCtx)
 
-	// Only navigate if we want an html file name, otherwise leave the blank page.
+	// Only navigate if we want an HTML file name, otherwise leave the blank page.
 	if name != "" {
 		if err := Run(ctx, Navigate(testdataDir+"/"+name)); err != nil {
 			tb.Fatal(err)
@@ -133,9 +138,8 @@ func testAllocateSeparate(tb testing.TB) (context.Context, context.CancelFunc) {
 	if err := Run(ctx); err != nil {
 		tb.Fatal(err)
 	}
-	ListenBrowser(ctx, func(ev interface{}) {
-		switch ev := ev.(type) {
-		case *runtime.EventExceptionThrown:
+	ListenBrowser(ctx, func(ev any) {
+		if ev, ok := ev.(*runtime.EventExceptionThrown); ok {
 			tb.Errorf("%+v\n", ev.ExceptionDetails)
 		}
 	})
@@ -175,7 +179,7 @@ func BenchmarkTabNavigate(b *testing.B) {
 	})
 }
 
-// checkPages fatals if the browser behind the chromedp context has an
+// checkTargets fatals if the browser behind the chromedp context has an
 // unexpected number of pages (tabs).
 func checkTargets(tb testing.TB, ctx context.Context, want int) {
 	tb.Helper()
@@ -257,6 +261,10 @@ func TestCancelError(t *testing.T) {
 		t.Fatalf("expected a nil error, got %v", err)
 	}
 
+	if err := Cancel(allocCtx); err != ErrInvalidContext {
+		t.Fatalf("want error %q, got %q", ErrInvalidContext, err)
+	}
+
 	/*
 		// NOTE: the following test no longer is applicable, as a slight change
 		// to chromium's 89 API deprecated the boolean return value
@@ -329,12 +337,21 @@ func TestConcurrentCancel(t *testing.T) {
 		ExecPath("/do-not-run-chrome"))
 	defer cancel()
 
+	var wg sync.WaitGroup
 	// 50 is enough for 'go test -race' to easily spot issues.
-	for i := 0; i < 50; i++ {
+	for range 50 {
+		wg.Add(2)
 		ctx, cancel := NewContext(allocCtx)
-		go cancel()
-		go Run(ctx)
+		go func() {
+			cancel()
+			wg.Done()
+		}()
+		go func() {
+			_ = Run(ctx)
+			wg.Done()
+		}()
 	}
+	wg.Wait()
 }
 
 func TestListenBrowser(t *testing.T) {
@@ -346,7 +363,7 @@ func TestListenBrowser(t *testing.T) {
 	// Check that many ListenBrowser callbacks work, including adding
 	// callbacks after the browser has been allocated.
 	var totalCount int32
-	ListenBrowser(ctx, func(ev interface{}) {
+	ListenBrowser(ctx, func(ev any) {
 		// using sync/atomic, as the browser is shared.
 		atomic.AddInt32(&totalCount, 1)
 	})
@@ -354,7 +371,7 @@ func TestListenBrowser(t *testing.T) {
 		t.Fatal(err)
 	}
 	seenSessions := make(map[target.SessionID]bool)
-	ListenBrowser(ctx, func(ev interface{}) {
+	ListenBrowser(ctx, func(ev any) {
 		if ev, ok := ev.(*target.EventAttachedToTarget); ok {
 			seenSessions[ev.SessionID] = true
 		}
@@ -383,7 +400,7 @@ func TestListenTarget(t *testing.T) {
 	// Check that many listen callbacks work, including adding callbacks
 	// after the target has been attached to.
 	var navigatedCount, updatedCount int
-	ListenTarget(ctx, func(ev interface{}) {
+	ListenTarget(ctx, func(ev any) {
 		if _, ok := ev.(*page.EventFrameNavigated); ok {
 			navigatedCount++
 		}
@@ -391,7 +408,7 @@ func TestListenTarget(t *testing.T) {
 	if err := Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	ListenTarget(ctx, func(ev interface{}) {
+	ListenTarget(ctx, func(ev any) {
 		if _, ok := ev.(*dom.EventDocumentUpdated); ok {
 			updatedCount++
 		}
@@ -421,7 +438,7 @@ func TestLargeEventCount(t *testing.T) {
 	// make the test fail somewhat reliably on old chromedp versions,
 	// without making the test too slow.
 	first := true
-	ListenTarget(ctx, func(ev interface{}) {
+	ListenTarget(ctx, func(ev any) {
 		if _, ok := ev.(*runtime.EventConsoleAPICalled); ok && first {
 			time.Sleep(50 * time.Millisecond)
 			first = false
@@ -444,7 +461,7 @@ func TestLargeQuery(t *testing.T) {
 
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "<html><body>\n")
-		for i := 0; i < 2000; i++ {
+		for i := range 2000 {
 			fmt.Fprintf(w, `<div>`)
 			fmt.Fprintf(w, `<a href="/%d">link %d</a>`, i, i)
 			fmt.Fprintf(w, `</div>`)
@@ -478,8 +495,7 @@ func TestDialTimeout(t *testing.T) {
 		url := "ws://" + l.(*net.TCPListener).Addr().String()
 		defer l.Close()
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		ctx := t.Context()
 		_, err = NewBrowser(ctx, url, WithDialTimeout(time.Microsecond))
 		got, want := fmt.Sprintf("%v", err), "i/o timeout"
 		if !strings.Contains(got, want) {
@@ -501,8 +517,7 @@ func TestDialTimeout(t *testing.T) {
 			}
 		}()
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		ctx := t.Context()
 		_, err = NewBrowser(ctx, url, WithDialTimeout(0))
 		got := fmt.Sprintf("%v", err)
 		if !strings.Contains(got, "EOF") && !strings.Contains(got, "connection reset") {
@@ -521,13 +536,13 @@ func TestListenCancel(t *testing.T) {
 	var browserCount, targetCount int
 
 	ctx1, cancel1 := context.WithCancel(ctx)
-	ListenBrowser(ctx1, func(ev interface{}) {
+	ListenBrowser(ctx1, func(ev any) {
 		browserCount++
 		cancel1()
 	})
 
 	ctx2, cancel2 := context.WithCancel(ctx)
-	ListenTarget(ctx2, func(ev interface{}) {
+	ListenTarget(ctx2, func(ev any) {
 		targetCount++
 		cancel2()
 	})
@@ -548,7 +563,7 @@ func TestLogOptions(t *testing.T) {
 
 	var bufMu sync.Mutex
 	var buf bytes.Buffer
-	fn := func(format string, a ...interface{}) {
+	fn := func(format string, a ...any) {
 		bufMu.Lock()
 		fmt.Fprintf(&buf, format, a...)
 		fmt.Fprintln(&buf)
@@ -579,6 +594,338 @@ func TestLogOptions(t *testing.T) {
 	}
 }
 
+func TestBrowserContext(t *testing.T) {
+	ctx, cancel := testAllocate(t, "child1.html")
+	defer cancel()
+	// There is not a dedicated cdp command to get the default browser context.
+	// Our workaround is to get it from a target which is created without the
+	// "browserContextId" parameter.
+	defaultBrowserContextID := getBrowserContext(t, ctx)
+
+	// Prepare 2 browser contexts to be used later.
+	rootCtx1, cancel := NewContext(browserCtx, WithNewBrowserContext())
+	defer cancel()
+	if err := Run(rootCtx1); err != nil {
+		t.Fatal(err)
+	}
+	rootBrowserContextID1 := FromContext(rootCtx1).BrowserContextID
+
+	rootCtx2, cancel := NewContext(browserCtx, WithNewBrowserContext())
+	defer cancel()
+	if err := Run(rootCtx2); err != nil {
+		t.Fatal(err)
+	}
+	rootBrowserContextID2 := FromContext(rootCtx2).BrowserContextID
+
+	tests := []struct {
+		name         string
+		arrange      func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID)
+		wantDisposed bool
+		wantPanic    string
+	}{
+		{
+			name: "default",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx, cancel := NewContext(browserCtx)
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+				return ctx, cancel, defaultBrowserContextID
+			},
+			wantDisposed: false,
+			wantPanic:    "",
+		},
+		{
+			name: "new",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx, cancel := NewContext(browserCtx, WithNewBrowserContext())
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+				c := FromContext(ctx)
+				return ctx, cancel, c.BrowserContextID
+			},
+			wantDisposed: true,
+			wantPanic:    "",
+		},
+		{
+			name: "existing",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx, cancel := NewContext(browserCtx, WithExistingBrowserContext(rootBrowserContextID1))
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+				return ctx, cancel, rootBrowserContextID1
+			},
+			wantDisposed: false,
+			wantPanic:    "",
+		},
+		{
+			name: "inherited 1",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx, cancel := NewContext(rootCtx1)
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+				return ctx, cancel, rootBrowserContextID1
+			},
+			wantDisposed: false,
+			wantPanic:    "",
+		},
+		{
+			name: "inherited 2",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx1, _ := NewContext(rootCtx1)
+				if err := Run(ctx1); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := NewContext(ctx1)
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+				return ctx, cancel, rootBrowserContextID1
+			},
+			wantDisposed: false,
+			wantPanic:    "",
+		},
+		{
+			name: "inherited 3",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx1, _ := NewContext(browserCtx, WithExistingBrowserContext(rootBrowserContextID1))
+				if err := Run(ctx1); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := NewContext(ctx1)
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+				return ctx, cancel, rootBrowserContextID1
+			},
+			wantDisposed: false,
+			wantPanic:    "",
+		},
+		{
+			name: "break inheritance 1",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx, cancel := NewContext(rootCtx1, WithExistingBrowserContext(rootBrowserContextID2))
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+				// The target should be added to the second browser context.
+				return ctx, cancel, rootBrowserContextID2
+			},
+			wantDisposed: false,
+			wantPanic:    "",
+		},
+		{
+			name: "break inheritance 2",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx, cancel := NewContext(rootCtx1, WithNewBrowserContext())
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+				c := FromContext(ctx)
+				if c.BrowserContextID == rootBrowserContextID1 {
+					t.Fatal("a new BrowserContext should be created")
+				}
+				return ctx, cancel, c.BrowserContextID
+			},
+			wantDisposed: true,
+			wantPanic:    "",
+		},
+		{
+			name: "break inheritance 3",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx, cancel := NewContext(rootCtx1, WithTargetID(FromContext(rootCtx2).Target.TargetID))
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+
+				c := FromContext(ctx)
+				if c.BrowserContextID != "" {
+					t.Fatal("when a context is used to attach to a tab, its BrowserContextID should be empty")
+				}
+
+				return ctx, cancel, rootBrowserContextID2
+			},
+			wantDisposed: false,
+			wantPanic:    "",
+		},
+		{
+			name: "WithNewBrowserContext when WithTargetID is specified",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx, _ := NewContext(rootCtx1)
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := NewContext(browserCtx, WithTargetID(FromContext(ctx).Target.TargetID), WithNewBrowserContext())
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+
+				return ctx, cancel, rootBrowserContextID1
+			},
+			wantDisposed: false,
+			wantPanic:    "WithNewBrowserContext can not be used when WithTargetID is specified",
+		},
+		{
+			name: "WithExistingBrowserContext when WithTargetID is specified",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx, _ := NewContext(rootCtx1)
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := NewContext(browserCtx, WithTargetID(FromContext(ctx).Target.TargetID), WithExistingBrowserContext(rootBrowserContextID2))
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+
+				return ctx, cancel, rootBrowserContextID1
+			},
+			wantDisposed: false,
+			wantPanic:    "WithExistingBrowserContext can not be used when WithTargetID is specified",
+		},
+		{
+			name: "WithNewBrowserContext before Browser is initialized",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx, cancel := NewContext(context.Background(), WithNewBrowserContext())
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+
+				return ctx, cancel, ""
+			},
+			wantDisposed: false,
+			wantPanic:    "WithNewBrowserContext can not be used before Browser is initialized",
+		},
+		{
+			name: "WithExistingBrowserContext before Browser is initialized",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				ctx, cancel := NewContext(context.Background(), WithExistingBrowserContext(rootBrowserContextID1))
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+
+				return ctx, cancel, ""
+			},
+			wantDisposed: false,
+			wantPanic:    "WithExistingBrowserContext can not be used before Browser is initialized",
+		},
+		{
+			name: "remote allocator WithExistingBrowserContext ",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				c := FromContext(browserCtx)
+				var conn *net.TCPConn
+				if chromedpConn, ok := c.Browser.conn.(*Conn); ok {
+					conn, _ = chromedpConn.conn.(*net.TCPConn)
+				}
+				if conn == nil {
+					t.Skip("skip when the remote debugging address is not available")
+				}
+				actx, _ := NewRemoteAllocator(context.Background(), "ws://"+conn.RemoteAddr().String())
+				ctx, cancel := NewContext(actx, WithExistingBrowserContext(rootBrowserContextID1))
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+
+				return ctx, cancel, rootBrowserContextID1
+			},
+			wantDisposed: false,
+			wantPanic:    "",
+		},
+		{
+			name: "remote allocator WithNewBrowserContext",
+			arrange: func(t *testing.T) (context.Context, context.CancelFunc, cdp.BrowserContextID) {
+				c := FromContext(browserCtx)
+				var conn *net.TCPConn
+				if chromedpConn, ok := c.Browser.conn.(*Conn); ok {
+					conn, _ = chromedpConn.conn.(*net.TCPConn)
+				}
+				if conn == nil {
+					t.Skip("skip when the remote debugging address is not available")
+				}
+				actx, _ := NewRemoteAllocator(context.Background(), "ws://"+conn.RemoteAddr().String())
+				ctx, cancel := NewContext(actx, WithNewBrowserContext())
+				if err := Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+
+				return ctx, cancel, FromContext(ctx).BrowserContextID
+			},
+			wantDisposed: true,
+			wantPanic:    "",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.wantPanic != "" {
+				defer func() {
+					if got := fmt.Sprint(recover()); got != test.wantPanic {
+						t.Errorf("want panic %q, got %q", test.wantPanic, got)
+					}
+				}()
+			}
+			ctx, cancel, want := test.arrange(t)
+			defer cancel()
+
+			got := getBrowserContext(t, ctx)
+
+			if got != want {
+				switch want {
+				case defaultBrowserContextID:
+					t.Errorf("want default browser context %q, got %q", want, got)
+				case rootBrowserContextID1:
+					t.Errorf("want root browser context 1 %q, got %q", want, got)
+				case rootBrowserContextID2:
+					t.Errorf("want root browser context 2 %q, got %q", want, got)
+				default:
+					t.Errorf("want browser context %q, got %q", want, got)
+				}
+			}
+
+			if want == defaultBrowserContextID {
+				// There is not way to check whether the default browser context
+				// is disposed, so stop here.
+				return
+			}
+
+			cancel()
+
+			var ids []cdp.BrowserContextID
+			if err := Run(browserCtx,
+				ActionFunc(func(ctx context.Context) error {
+					c := FromContext(ctx)
+					var err error
+					ids, err = target.GetBrowserContexts().Do(cdp.WithExecutor(ctx, c.Browser))
+					return err
+				}),
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			disposed := !slices.Contains(ids, want)
+
+			if disposed != test.wantDisposed {
+				t.Errorf("browser context disposed = %v, want %v", disposed, test.wantDisposed)
+			}
+		})
+	}
+}
+
+func getBrowserContext(tb testing.TB, ctx context.Context) cdp.BrowserContextID {
+	var id cdp.BrowserContextID
+	if err := Run(ctx,
+		ActionFunc(func(ctx context.Context) error {
+			info, err := target.GetTargetInfo().Do(ctx)
+			id = info.BrowserContextID
+			return err
+		}),
+	); err != nil {
+		tb.Fatal(err)
+	}
+	return id
+}
+
 func TestLargeOutboundMessages(t *testing.T) {
 	t.Parallel()
 
@@ -603,7 +950,7 @@ func TestDirectCloseTarget(t *testing.T) {
 	want := "to close the target, cancel its context"
 
 	// Check that nothing is closed by running the action twice.
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		err := Run(ctx, ActionFunc(func(ctx context.Context) error {
 			return target.CloseTarget(c.Target.TargetID).Do(ctx)
 		}))
@@ -624,7 +971,7 @@ func TestDirectCloseBrowser(t *testing.T) {
 	want := "use chromedp.Cancel"
 
 	// Check that nothing is closed by running the action twice.
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		err := browser.Close().Do(cdp.WithExecutor(ctx, c.Browser))
 		got := fmt.Sprint(err)
 		if !strings.Contains(got, want) {
@@ -639,11 +986,7 @@ func TestDownloadIntoDir(t *testing.T) {
 	ctx, cancel := testAllocate(t, "")
 	defer cancel()
 
-	dir, err := ioutil.TempDir("", "chromedp-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -657,26 +1000,38 @@ func TestDownloadIntoDir(t *testing.T) {
 	}))
 	defer s.Close()
 
+	done := make(chan string, 1)
+	ListenTarget(ctx, func(v any) {
+		if ev, ok := v.(*browser.EventDownloadProgress); ok {
+			if ev.State == browser.DownloadProgressStateCompleted {
+				done <- ev.GUID
+				close(done)
+			}
+		}
+	})
+
 	if err := Run(ctx,
 		Navigate(s.URL),
-		page.SetDownloadBehavior(page.SetDownloadBehaviorBehaviorAllow).WithDownloadPath(dir),
+		browser.SetDownloadBehavior(browser.SetDownloadBehaviorBehaviorAllowAndName).WithDownloadPath(dir).WithEventsEnabled(true),
 		Click("#download", ByQuery),
 	); err != nil {
 		t.Fatal(err)
 	}
 
-	// TODO: wait for the download to finish, and check that the file is in
-	// the directory.
+	select {
+	case <-ctx.Done():
+		t.Fatalf("unexpected error: %v", ctx.Err())
+	case guid := <-done:
+		if _, err := os.Stat(filepath.Join(dir, guid)); err != nil {
+			t.Fatalf("want error nil, got: %v", err)
+		}
+	}
 }
 
 func TestGracefulBrowserShutdown(t *testing.T) {
 	t.Parallel()
 
-	dir, err := ioutil.TempDir("", "chromedp-test")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// TODO(mvdan): this doesn't work with DefaultExecAllocatorOptions+UserDataDir
 	opts := []ExecAllocatorOption{
@@ -759,7 +1114,7 @@ func TestAttachingToWorkers(t *testing.T) {
 
 			ch := make(chan target.ID, 1)
 
-			ListenTarget(ctx, func(ev interface{}) {
+			ListenTarget(ctx, func(ev any) {
 				if ev, ok := ev.(*target.EventAttachedToTarget); ok {
 					if !strings.Contains(ev.TargetInfo.Type, "worker") {
 						return
@@ -935,7 +1290,6 @@ func TestRunResponse(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		allocate := func(t *testing.T) context.Context {
 			ctx, cancel := testAllocate(t, "")
 			t.Cleanup(cancel)
@@ -971,6 +1325,16 @@ func TestRunResponse(t *testing.T) {
 			}
 			if want := test.wantStatus; want != 0 && status != want {
 				t.Fatalf("wanted status code %d, got %d", want, status)
+			}
+
+			if resp != nil {
+				latency := time.Since(resp.ResponseTime.Time())
+				if latency > time.Hour || latency < -time.Hour {
+					t.Errorf("responseTime does not hold a reasonable value %s. "+
+						"Maybe it's in seconds now and we should remove the workaround. "+
+						"See https://github.com/chromedp/pdlgen/issues/22.",
+						resp.ResponseTime.Time())
+				}
 			}
 		}
 		t.Run("Navigate"+test.name, func(t *testing.T) {
@@ -1045,5 +1409,162 @@ func TestRunResponse_noResponse(t *testing.T) {
 		} else if resp != nil && !step.wantResp {
 			t.Fatalf("%s: did not want a response, got: %#v", step.name, resp)
 		}
+	}
+}
+
+// TestWebGL tests that WebGL is correctly configured in headless-shell.
+//
+// This is a regress test for https://github.com/chromedp/chromedp/issues/1073.
+func TestWebGL(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := testAllocate(t, "webgl.html")
+	defer cancel()
+
+	var buf []byte
+	if err := Run(ctx,
+		Poll("rendered", nil, WithPollingTimeout(2*time.Second)),
+		Screenshot(`#c`, &buf, ByQuery),
+	); err != nil {
+		if errors.Is(err, ErrPollingTimeout) {
+			t.Fatal("The cube is not rendered in 2s.")
+		} else {
+			t.Fatal(err)
+		}
+	}
+
+	img, err := png.Decode(bytes.NewReader(buf))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bounds := img.Bounds()
+	if bounds.Dx() != 200 || bounds.Dy() != 200 {
+		t.Fatalf("Unexpected screenshot size. got: %d x %d, want 200 x 200.", bounds.Dx(), bounds.Dy())
+	}
+
+	isWhite := func(c color.Color) bool {
+		r, g, b, _ := c.RGBA()
+		return r == 0xffff && g == 0xffff && b == 0xffff
+	}
+	if isWhite(img.At(100, 100)) {
+		t.Fatal("When the cube is rendered correctly, the color at the middle of the canvas should not be white.")
+	}
+}
+
+// TestPDFTemplate tests that the resource pack is loaded in headless-shell.
+//
+// When it's correctly loaded, the header/footer templates that use the
+// following values should work as expected:
+//   - title
+//   - url
+//   - pageNumber
+//   - totalPages
+//
+// This is a regress test for https://github.com/chromedp/chromedp/issues/922.
+func TestPDFTemplate(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := testAllocate(t, "")
+	defer cancel()
+
+	var buf []byte
+	if err := Run(ctx,
+		Navigate("about:blank"),
+		ActionFunc(func(ctx context.Context) error {
+			frameTree, err := page.GetFrameTree().Do(ctx)
+			if err != nil {
+				return err
+			}
+
+			return page.SetDocumentContent(frameTree.Frame.ID, `
+				<html>
+					<head>
+						<title>PDF Template</title>
+					</head>
+					<body>
+						Hello World!
+					</body>
+				</html>
+			`).Do(ctx)
+		}),
+		ActionFunc(func(ctx context.Context) error {
+			var err error
+			buf, _, err = page.PrintToPDF().
+				WithMarginTop(0.5).
+				WithMarginBottom(0.5).
+				WithDisplayHeaderFooter(true).
+				WithHeaderTemplate(`<div style="font-size:8px;width:100%;text-align:center;"><span class="title"></span> -- <span class="url"></span></div>`).
+				WithFooterTemplate(`<div style="font-size:8px;width:100%;text-align:center;">(<span class="pageNumber"></span> / <span class="totalPages"></span>)</div>`).
+				Do(ctx)
+
+			return err
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := pdf.NewReader(bytes.NewReader(buf), int64(len(buf)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := r.GetPlainText()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []byte("Hello World!PDF Template -- about:blank(1 / 1)")
+	l := len(want)
+	// try to reuse buf
+	if len(buf) >= l {
+		buf = buf[0:l]
+	} else {
+		buf = make([]byte, l)
+	}
+	n, err := io.ReadFull(b, buf)
+	if err != nil && !(errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+		t.Fatal(err)
+	}
+	buf = buf[:n]
+
+	if !bytes.Equal(buf, want) {
+		t.Errorf("page.PrintToPDF produces unexpected content. got: %q, want: %q", buf, want)
+	}
+}
+
+// regression test for https://github.com/chromedp/chromedp/issues/1551
+func TestPDFBackground(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := testAllocate(t, "")
+	defer cancel()
+
+	var buf []byte
+	if err := Run(ctx,
+		Navigate("about:blank"),
+		ActionFunc(func(ctx context.Context) error {
+			frameTree, err := page.GetFrameTree().Do(ctx)
+			if err != nil {
+				return err
+			}
+			return page.SetDocumentContent(frameTree.Frame.ID, `
+				<html lang="en">
+					<head></head>
+					<body style="background-color:green">
+						<p>Lorem ipsum</p>
+					</body>
+				</html>
+			`).Do(ctx)
+		}),
+		ActionFunc(func(ctx context.Context) error {
+			var err error
+			buf, _, err = page.PrintToPDF().Do(ctx)
+			return err
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("background.pdf", buf, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

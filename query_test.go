@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/css"
 	"github.com/chromedp/cdproto/dom"
+	cdpruntime "github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp/kb"
 )
 
@@ -185,6 +187,97 @@ func TestAtLeast(t *testing.T) {
 	}
 	if len(nodes) < 3 {
 		t.Errorf("expected to have at least 3 nodes: got %d", len(nodes))
+	}
+}
+
+func TestRetryInterval(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		opts         []QueryOption
+		wantCountMin int
+		wantCountMax int
+	}{
+		{
+			name: "default",
+			opts: []QueryOption{},
+			// in 100ms
+			wantCountMin: 5,
+			wantCountMax: 20,
+		},
+		{
+			name: "large interval",
+			opts: []QueryOption{RetryInterval(60 * time.Millisecond)},
+			// in 100ms
+			wantCountMin: 1,
+			wantCountMax: 2,
+		},
+	}
+
+	ctx, cancel := testAllocate(t, "js.html")
+	defer cancel()
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			retryCount := 0
+
+			// count is a wait function that makes the query always fail and
+			// counts the number of retries. Note that the wait func is called
+			// only after the number of result nodes >= s.exp .
+			count := WaitFunc(
+				func(ctx context.Context, f *cdp.Frame, eci cdpruntime.ExecutionContextID, ni ...cdp.NodeID) ([]*cdp.Node, error) {
+					retryCount++
+					return nil, ErrInvalidTarget
+				},
+			)
+
+			ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+			defer cancel()
+
+			opts := append(tc.opts, count)
+			err := Run(ctx, Query("//input", opts...))
+
+			if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("want error context.DeadlineExceeded, got: %v", err)
+			}
+			if retryCount < tc.wantCountMin {
+				t.Fatalf("want retry count > %d, got: %d", tc.wantCountMin, retryCount)
+			}
+			if retryCount > tc.wantCountMax {
+				t.Fatalf("want retry count < %d, got: %d", tc.wantCountMax, retryCount)
+			}
+		})
+	}
+}
+
+func TestNoRetryForInvalidSelector(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := testAllocate(t, "table.html")
+	defer cancel()
+
+	ctx, cancel = context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	tests := []struct {
+		name    string
+		sel     string
+		by      QueryOption
+		wantErr string
+	}{
+		{`pseudo class`, `#a:b`, ByQuery, "DOM Error while querying (-32000)"},
+		{`leading number`, `#3`, ByQuery, "DOM Error while querying (-32000)"},
+		{`empty selector`, ``, ByQuery, "DOM Error while querying (-32000)"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var nodes []*cdp.Node
+			if err := Run(ctx, Nodes(test.sel, &nodes, test.by)); err.Error() != test.wantErr {
+				t.Fatalf("want error %v, got error: %v", test.wantErr, err)
+			}
+		})
 	}
 }
 
@@ -434,7 +527,6 @@ func TestClear(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -478,7 +570,6 @@ func TestReset(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -561,7 +652,6 @@ func TestSetValue(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -766,7 +856,6 @@ func TestSetAttributes(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -843,7 +932,6 @@ func TestSetAttributeValue(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -888,7 +976,6 @@ func TestRemoveAttribute(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -929,7 +1016,6 @@ func TestClick(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -967,7 +1053,6 @@ func TestDoubleClick(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -1008,7 +1093,6 @@ func TestSendKeys(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		i, test := i, test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			if runtime.GOOS == "darwin" && i == 5 {
 				t.Skipf("skipping test %d on darwin -- FIXME!", i)
@@ -1049,7 +1133,6 @@ func TestSubmit(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -1087,7 +1170,6 @@ func TestComputedStyle(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -1139,7 +1221,6 @@ func TestMatchedStyle(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -1172,7 +1253,7 @@ func TestFileUpload(t *testing.T) {
 		}
 		defer f.Close()
 
-		buf, err := ioutil.ReadAll(f)
+		buf, err := io.ReadAll(f)
 		if err != nil {
 			http.Error(res, err.Error(), http.StatusBadRequest)
 			return
@@ -1183,25 +1264,16 @@ func TestFileUpload(t *testing.T) {
 	s := httptest.NewServer(mux)
 	defer s.Close()
 
-	// create temporary file on disk
-	tmpfile, err := ioutil.TempFile("", "chromedp-upload-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(tmpfile.Name())
-	defer tmpfile.Close()
-	if _, err := tmpfile.WriteString(uploadHTML); err != nil {
-		t.Fatal(err)
-	}
-	if err := tmpfile.Close(); err != nil {
+	uploadFile := filepath.Join(t.TempDir(), "chromedp-upload-test")
+	if err := os.WriteFile(uploadFile, []byte(uploadHTML), 0o666); err != nil {
 		t.Fatal(err)
 	}
 
 	tests := []struct {
 		a Action
 	}{
-		{SendKeys(`input[name="upload"]`, tmpfile.Name(), NodeVisible)},
-		{SetUploadFiles(`input[name="upload"]`, []string{tmpfile.Name()}, NodeVisible)},
+		{SendKeys(`input[name="upload"]`, uploadFile, NodeVisible)},
+		{SetUploadFiles(`input[name="upload"]`, []string{uploadFile}, NodeVisible)},
 	}
 
 	// Don't run these tests in parallel. The only way to do so would be to
@@ -1325,7 +1397,6 @@ func TestSVGFullXPath(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("%02d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -1391,7 +1462,7 @@ func TestWaitReadyReuseAction(t *testing.T) {
 
 	// Reusing a single WaitReady action used to panic.
 	action := WaitReady("#input2", ByID)
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if err := Run(ctx, action); err != nil {
 			t.Fatalf("got error: %v", err)
 		}

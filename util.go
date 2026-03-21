@@ -1,84 +1,131 @@
 package chromedp
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/chromedp/cdproto"
 	"github.com/chromedp/cdproto/cdp"
+	"slices"
 )
 
 // forceIP tries to force the host component in urlstr to be an IP address.
 //
 // Since Chrome 66+, Chrome DevTools Protocol clients connecting to a browser
 // must send the "Host:" header as either an IP address, or "localhost".
-func forceIP(urlstr string) string {
+// See https://github.com/chromium/chromium/commit/0e914b95f7cae6e8238e4e9075f248f801c686e6.
+func forceIP(ctx context.Context, urlstr string) (string, error) {
 	u, err := url.Parse(urlstr)
 	if err != nil {
-		return urlstr
+		return "", err
 	}
 	host, port, err := net.SplitHostPort(u.Host)
 	if err != nil {
-		return urlstr
+		return "", err
 	}
-	addr, err := net.ResolveIPAddr("ip", host)
+	host, err = resolveHost(ctx, host)
 	if err != nil {
-		return urlstr
+		return "", err
 	}
-	u.Host = net.JoinHostPort(addr.IP.String(), port)
-	return u.String()
+	u.Host = net.JoinHostPort(host, port)
+	return u.String(), nil
 }
 
-// detectURL detects the websocket debugger URL if the provided URL is not a
-// valid websocket debugger URL.
-//
-// A valid websocket debugger URL is something like:
-// ws://127.0.0.1:9222/devtools/browser/...
-// The original URL with the following formats are accepted:
-// * ws://127.0.0.1:9222/
-// * http://127.0.0.1:9222/
-func detectURL(urlstr string) string {
-	if strings.Contains(urlstr, "/devtools/browser/") {
-		return urlstr
+// resolveHost tries to resolve a host to be an IP address. If the host is
+// an IP address or "localhost", it returns the host directly.
+func resolveHost(ctx context.Context, host string) (string, error) {
+	if host == "localhost" {
+		return host, nil
+	}
+	ip := net.ParseIP(host)
+	if ip != nil {
+		return host, nil
 	}
 
-	// replace the scheme and path to construct the URL like:
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return "", err
+	}
+
+	return addrs[0].IP.String(), nil
+}
+
+// modifyURL modifies the websocket debugger URL if the provided URL is not a
+// valid websocket debugger URL.
+//
+// A websocket debugger URL containing "/devtools/browser/" are considered
+// valid. In this case, urlstr will only be modified by forceIP.
+//
+// Otherwise, it will construct a URL like http://[host]:[port]/json/version
+// and query the valid websocket debugger URL from this endpoint. The [host]
+// and [port] are parsed from the urlstr. If the host component is not an IP,
+// it will be resolved to an IP first. Example parameters:
+//   - ws://127.0.0.1:9222/
+//   - http://127.0.0.1:9222/
+//   - http://container-name:9222/
+func modifyURL(ctx context.Context, urlstr string) (string, error) {
+	lctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	if strings.Contains(urlstr, "/devtools/browser/") {
+		return forceIP(lctx, urlstr)
+	}
+
+	// replace the scheme and path to construct a URL like:
 	// http://127.0.0.1:9222/json/version
 	u, err := url.Parse(urlstr)
 	if err != nil {
-		return urlstr
+		return "", err
 	}
 	u.Scheme = "http"
+	host, port, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		return "", err
+	}
+	host, err = resolveHost(ctx, host)
+	if err != nil {
+		return "", err
+	}
+	u.Host = net.JoinHostPort(host, port)
 	u.Path = "/json/version"
 
 	// to get "webSocketDebuggerUrl" in the response
-	resp, err := http.Get(forceIP(u.String()))
+	req, err := http.NewRequestWithContext(lctx, "GET", u.String(), nil)
 	if err != nil {
-		return urlstr
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return urlstr
+		return "", err
 	}
-	// the browser will construct the debugger URL using the "host" header of the /json/version request.
-	// for example, run headless-shell in a container: docker run -d -p 9000:9222 chromedp/headless-shell:latest
-	// then: curl http://127.0.0.1:9000/json/version
-	// and the debugger URL will be something like: ws://127.0.0.1:9000/devtools/browser/...
+	// the browser will construct the debugger URL using the "host" header of
+	// the /json/version request. For example, run headless-shell in a container:
+	//     docker run -d -p 9000:9222 chromedp/headless-shell:latest
+	// then:
+	//     curl http://127.0.0.1:9000/json/version
+	// and the websocket debugger URL will be something like:
+	// ws://127.0.0.1:9000/devtools/browser/...
 	wsURL := result["webSocketDebuggerUrl"].(string)
-	return wsURL
+	return wsURL, nil
 }
 
-func runListeners(list []cancelableListener, ev interface{}) []cancelableListener {
+func runListeners(list []cancelableListener, ev any) []cancelableListener {
 	for i := 0; i < len(list); {
 		listener := list[i]
 		select {
 		case <-listener.ctx.Done():
-			list = append(list[:i], list[i+1:]...)
+			list = slices.Delete(list, i, i+1)
 			continue
 		default:
 			listener.fn(ev)
@@ -311,6 +358,11 @@ func distributedNodesUpdated(nodes []*cdp.BackendNode) nodeOp {
 	}
 }
 
+func scrollableFlagUpdated(m map[cdp.NodeID]*cdp.Node, id cdp.NodeID) nodeOp {
+	return func(n *cdp.Node) {
+	}
+}
+
 func insertNode(n []*cdp.Node, prevID cdp.NodeID, c *cdp.Node) []*cdp.Node {
 	var i int
 	var found bool
@@ -351,7 +403,7 @@ func removeNode(n []*cdp.Node, id cdp.NodeID) []*cdp.Node {
 		return n
 	}
 
-	return append(n[:i], n[i+1:]...)
+	return slices.Delete(n, i, i+1)
 }
 
 // isCouldNotComputeBoxModelError unwraps err as a MessageError and determines

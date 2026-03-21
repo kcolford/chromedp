@@ -3,8 +3,8 @@ package chromedp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -71,6 +71,37 @@ func TestExecAllocatorCancelParent(t *testing.T) {
 	}
 }
 
+func TestExecAllocatorCombinedOutputPanic(t *testing.T) {
+	t.Parallel()
+
+	buf := new(bytes.Buffer)
+	allocCtx, cancel := NewExecAllocator(context.Background(),
+		append([]ExecAllocatorOption{
+			CombinedOutput(buf),
+			Flag("enable-logging", true),
+			WSURLReadTimeout(1), // trigger err
+		}, allocOpts...)...)
+	defer cancel()
+
+	ctx, _ := NewContext(allocCtx, browserOpts...)
+
+	if _, err := FromContext(ctx).Allocator.Allocate(ctx, WithDialTimeout(1)); err != nil &&
+		err.Error() != "websocket url timeout reached" &&
+		!strings.Contains(err.Error(), "i/o timeout") {
+		t.Fatal(err)
+	}
+
+	// give time for the `readOutput` goroutine to finish
+	// this can vary depending on the system, so we give it a bit more time
+	time.Sleep(5 * time.Second)
+
+	cancel()
+	// dir cleanup occurs after 10 milliseconds so this gives a bit more time
+	// for the cleanup, otherwise the test may fail with a panic about the
+	// directory not being removed
+	time.Sleep(20 * time.Millisecond)
+}
+
 func TestExecAllocatorKillBrowser(t *testing.T) {
 	t.Parallel()
 
@@ -127,6 +158,8 @@ func TestRemoteAllocator(t *testing.T) {
 	tests := []struct {
 		name      string
 		modifyURL func(wsURL string) string
+		opts      []RemoteAllocatorOption
+		wantErr   string
 	}{
 		{
 			name:      "original wsURL",
@@ -155,32 +188,36 @@ func TestRemoteAllocator(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				_, post, err := net.SplitHostPort(u.Host)
+				_, port, err := net.SplitHostPort(u.Host)
 				if err != nil {
 					t.Fatal(err)
 				}
-				u.Host = net.JoinHostPort(h, post)
+				u.Host = net.JoinHostPort(h, port)
 				u.Path = "/"
 				return u.String()
 			},
 		},
+		{
+			name: "NoModifyURL",
+			modifyURL: func(wsURL string) string {
+				return wsURL[0:strings.Index(wsURL, "devtools")]
+			},
+			opts:    []RemoteAllocatorOption{NoModifyURL},
+			wantErr: "could not dial",
+		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			testRemoteAllocator(t, tt.modifyURL)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testRemoteAllocator(t, test.modifyURL, test.wantErr, test.opts)
 		})
 	}
 }
 
-func testRemoteAllocator(t *testing.T, modifyURL func(wsURL string) string) {
-	tempDir, err := ioutil.TempDir("", "chromedp-runner")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tempDir)
+func testRemoteAllocator(t *testing.T, modifyURL func(wsURL string) string, wantErr string, opts []RemoteAllocatorOption) {
+	tempDir := t.TempDir()
 
-	procCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	procCtx, procCancel := context.WithCancel(context.Background())
+	defer procCancel()
 	cmd := exec.CommandContext(procCtx, execPath,
 		// TODO: deduplicate these with allocOpts in chromedp_test.go
 		"--no-first-run",
@@ -204,20 +241,29 @@ func testRemoteAllocator(t *testing.T, modifyURL func(wsURL string) string) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	wsURL, err := readOutput(stderr, nil, nil)
+	wsURL, _, err := readOutput(stderr, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	allocCtx, allocCancel := NewRemoteAllocator(context.Background(), modifyURL(wsURL))
+	allocCtx, allocCancel := NewRemoteAllocator(context.Background(), modifyURL(wsURL), opts...)
 	defer allocCancel()
 
 	taskCtx, taskCancel := NewContext(allocCtx,
 		// This used to crash when used with RemoteAllocator.
-		WithLogf(func(format string, args ...interface{}) {}),
+		WithLogf(func(format string, args ...any) {}),
 	)
 
 	{
 		infos, err := Targets(taskCtx)
+		if len(wantErr) > 0 {
+			if err == nil || !strings.Contains(err.Error(), wantErr) {
+				t.Fatalf("\ngot error:\n\t%v\nwant error contains:\n\t%s", err, wantErr)
+			}
+
+			procCancel()
+			cmd.Wait()
+			return
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -264,16 +310,14 @@ func testRemoteAllocator(t *testing.T, modifyURL func(wsURL string) string) {
 	// TODO: a "defer cancel()" here adds a 1s timeout, since we try to
 	// close the target twice. Fix that.
 	ctx, _ := NewContext(allocCtx)
-	ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	// Connect to the browser, then kill it.
 	if err := Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := cmd.Process.Signal(os.Kill); err != nil {
-		t.Error(err)
-	}
+	procCancel()
 	switch err := Run(ctx, Navigate(testdataDir+"/form.html")); err {
 	case nil:
 		// TODO: figure out why this happens sometimes on Travis
@@ -281,6 +325,7 @@ func testRemoteAllocator(t *testing.T, modifyURL func(wsURL string) string) {
 	case context.DeadlineExceeded:
 		t.Fatalf("did not expect a standard context error: %v", err)
 	}
+	cmd.Wait()
 }
 
 func TestExecAllocatorMissingWebsocketAddr(t *testing.T) {
@@ -296,7 +341,7 @@ func TestExecAllocatorMissingWebsocketAddr(t *testing.T) {
 	defer cancel()
 
 	// set the "s" flag to let "." match "\n"
-	// in Github Actions, the error text could be:
+	// in GitHub Actions, the error text could be:
 	// "chrome failed to start:\n/bin/bash: /etc/profile.d/env_vars.sh: Permission denied\nmkdir: cannot create directory ‘/run/user/1001’: Permission denied\n[0321/081807.491906:ERROR:headless_shell.cc(720)] Invalid devtools server address\n"
 	want := `failed to start`
 	got := fmt.Sprintf("%v", Run(ctx))
@@ -397,7 +442,7 @@ func TestWithBrowserOptionAlreadyAllocated(t *testing.T) {
 	// This needs to panic, as we try to set up a browser logf function
 	// after the browser has already been set up earlier.
 	_, _ = NewContext(ctx,
-		WithLogf(func(format string, args ...interface{}) {}),
+		WithLogf(func(format string, args ...any) {}),
 	)
 }
 
@@ -425,5 +470,44 @@ func TestModifyCmdFunc(t *testing.T) {
 
 	if ret != tz {
 		t.Fatalf("got %s, want %s", ret, tz)
+	}
+}
+
+// TestStartsWithNonBlankTab is a regression test to make sure chromedp won't
+// hang when the browser is started with a non-blank tab.
+//
+// In the following cases, the browser will start with a non-blank tab:
+// 1. with the "--app" option (should disable headless mode);
+// 2. URL other than "about:blank" is placed in the command line arguments.
+//
+// It's hard to disable headless mode on test servers, so we will go with
+// case 2 here.
+func TestStartsWithNonBlankTab(t *testing.T) {
+	t.Parallel()
+
+	allocCtx, cancel := NewExecAllocator(context.Background(),
+		append(allocOpts,
+			ModifyCmdFunc(func(cmd *exec.Cmd) {
+				// it assumes that the last argument is "about:blank" and
+				// replace it with other URL.
+				cmd.Args[len(cmd.Args)-1] = testdataDir + "/form.html"
+			}),
+		)...)
+	defer cancel()
+
+	ctx, cancel := NewContext(allocCtx)
+	defer cancel()
+
+	ctx, cancel = context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	if err := Run(ctx,
+		Navigate(testdataDir+"/form.html"),
+	); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Error("chromedp hangs when the browser starts with a non-blank tab.")
+		} else {
+			t.Errorf("got error %s, want nil", err)
+		}
 	}
 }

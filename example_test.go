@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -116,7 +115,7 @@ func ExampleRunResponse() {
 }
 
 func ExampleExecAllocator() {
-	dir, err := ioutil.TempDir("", "chromedp-example")
+	dir, err := os.MkdirTemp("", "chromedp-example")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -140,7 +139,7 @@ func ExampleExecAllocator() {
 	}
 
 	path := filepath.Join(dir, "DevToolsActivePort")
-	bs, err := ioutil.ReadFile(path)
+	bs, err := os.ReadFile(path)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -177,7 +176,7 @@ func ExampleNewContext_reuseBrowser() {
 		log.Fatal(err)
 	}
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		func() {
 			ctx, cancel := context.WithTimeout(ctx, time.Second)
 			defer cancel()
@@ -244,7 +243,7 @@ func ExampleListenTarget_consoleLog() {
 	defer ts.Close()
 
 	gotException := make(chan bool, 1)
-	chromedp.ListenTarget(ctx, func(ev interface{}) {
+	chromedp.ListenTarget(ctx, func(ev any) {
 		switch ev := ev.(type) {
 		case *runtime.EventConsoleAPICalled:
 			fmt.Printf("* console.%s call:\n", ev.Type)
@@ -326,7 +325,7 @@ func ExampleListenTarget_acceptAlert() {
 	`))
 	defer ts.Close()
 
-	chromedp.ListenTarget(ctx, func(ev interface{}) {
+	chromedp.ListenTarget(ctx, func(ev any) {
 		if ev, ok := ev.(*page.EventJavascriptDialogOpening); ok {
 			fmt.Println("closing alert:", ev.Message)
 			go func() {
@@ -402,7 +401,7 @@ func ExampleEmulate() {
 		log.Fatal(err)
 	}
 
-	if err := ioutil.WriteFile("iphone7-ua.png", buf, 0o644); err != nil {
+	if err := os.WriteFile("iphone7-ua.png", buf, 0o644); err != nil {
 		log.Fatal(err)
 	}
 
@@ -428,7 +427,7 @@ func ExamplePrintToPDF() {
 		log.Fatal(err)
 	}
 
-	if err := ioutil.WriteFile("page.pdf", buf, 0o644); err != nil {
+	if err := os.WriteFile("page.pdf", buf, 0o644); err != nil {
 		log.Fatal(err)
 	}
 
@@ -518,14 +517,14 @@ func ExampleFromNode() {
 	// Nested query from the document root: inner content
 }
 
-func Example_documentDump() {
+func Example_dump() {
 	ctx, cancel := chromedp.NewContext(context.Background())
 	defer cancel()
 
 	ts := httptest.NewServer(writeHTML(`<!doctype html>
 <html>
 <body>
-  <div id="content">the content</div>
+  <div id="content" style="display:block;">the content</div>
 </body>
 </html>`))
 	defer ts.Close()
@@ -538,22 +537,64 @@ func Example_documentDump() {
 		b.insertBefore(el, b.childNodes[0]);
 	})(document, %q, %q);`
 
+	s := fmt.Sprintf(expr, "thing", "a new thing!")
+
+	var buf bytes.Buffer
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(ts.URL),
+		chromedp.WaitVisible(`#content`),
+		chromedp.Evaluate(s, nil),
+		chromedp.WaitVisible(`#thing`),
+		chromedp.Dump(`document`, &buf, chromedp.ByJSPath),
+	); err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("Document tree:")
+	fmt.Print(buf.String())
+
+	// Output:
+	// Document tree:
+	// #document <Document>
+	//   html <DocumentType>
+	//   html
+	//     head
+	//     body
+	//       div#thing
+	//         #text "a new thing!"
+	//       div#content [style="display:block;"]
+	//         #text "the content"
+}
+
+func Example_documentDump() {
+	ctx, cancel := chromedp.NewContext(context.Background())
+	defer cancel()
+
+	ts := httptest.NewServer(writeHTML(`<!doctype html>
+<html>
+<body>
+  <div id="content" style="display:block;">the content</div>
+</body>
+</html>`))
+	defer ts.Close()
+
+	const expr = `(function(d, id, v) {
+		var b = d.querySelector('body');
+		var el = d.createElement('div');
+		el.id = id;
+		el.innerText = v;
+		b.insertBefore(el, b.childNodes[0]);
+	})(document, %q, %q);`
+
+	s := fmt.Sprintf(expr, "thing", "a new thing!")
+
 	var nodes []*cdp.Node
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(ts.URL),
-		chromedp.Nodes(`document`, &nodes, chromedp.ByJSPath),
+		chromedp.Nodes(`document`, &nodes,
+			chromedp.ByJSPath, chromedp.Populate(-1, true)),
 		chromedp.WaitVisible(`#content`),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			s := fmt.Sprintf(expr, "thing", "a new thing!")
-			_, exp, err := runtime.Evaluate(s).Do(ctx)
-			if err != nil {
-				return err
-			}
-			if exp != nil {
-				return exp
-			}
-			return nil
-		}),
+		chromedp.Evaluate(s, nil),
 		chromedp.WaitVisible(`#thing`),
 	); err != nil {
 		log.Fatal(err)
@@ -571,7 +612,7 @@ func Example_documentDump() {
 	//       body
 	//         div#thing
 	//           #text "a new thing!"
-	//         div#content
+	//         div#content [style="display:block;"]
 	//           #text "the content"
 }
 
@@ -587,10 +628,121 @@ func ExampleFullScreenshot() {
 		log.Fatal(err)
 	}
 
-	if err := ioutil.WriteFile("fullScreenshot.jpeg", buf, 0644); err != nil {
+	if err := os.WriteFile("fullScreenshot.jpeg", buf, 0o644); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("wrote fullScreenshot.jpeg")
 	// Output:
 	// wrote fullScreenshot.jpeg
+}
+
+func ExampleEvaluate() {
+	ctx, cancel := chromedp.NewContext(context.Background())
+	defer cancel()
+
+	// Ignore the result:
+	{
+		if err := chromedp.Run(ctx,
+			chromedp.Evaluate(`window.scrollTo(0, 100)`, nil),
+		); err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	// Receive a primary value:
+	{
+		var sum int
+		if err := chromedp.Run(ctx,
+			chromedp.Evaluate(`1+2`, &sum),
+		); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(sum)
+	}
+
+	// ErrJSUndefined:
+	{
+		var val int
+		if err := chromedp.Run(ctx,
+			chromedp.Evaluate(`undefined`, &val),
+		); err != nil {
+			fmt.Println(err)
+		}
+	}
+
+	// ErrJSNull:
+	{
+		var val int
+		if err := chromedp.Run(ctx,
+			chromedp.Evaluate(`null`, &val),
+		); err != nil {
+			fmt.Println(err)
+		}
+	}
+
+	// Accept undefined/null result:
+	{
+		var val *int
+		if err := chromedp.Run(ctx,
+			chromedp.Evaluate(`undefined`, &val),
+		); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(val)
+	}
+
+	// Receive an array value:
+	{
+		var val []int
+		if err := chromedp.Run(ctx,
+			chromedp.Evaluate(`[1,2]`, &val),
+		); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(val)
+	}
+
+	// Map and Slice accept undefined/null:
+	{
+		var val []int
+		if err := chromedp.Run(ctx,
+			chromedp.Evaluate(`null`, &val),
+		); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("slice is nil:", val == nil)
+	}
+
+	// Receive the raw bytes:
+	{
+		var buf []byte
+		if err := chromedp.Run(ctx,
+			chromedp.Evaluate(`alert`, &buf),
+		); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("%s\n", buf)
+	}
+
+	// Receive the RemoteObject:
+	{
+		var res *runtime.RemoteObject
+		if err := chromedp.Run(ctx,
+			chromedp.Evaluate(`alert`, &res),
+		); err != nil {
+			log.Fatal(err)
+		}
+		if res.ObjectID != "" {
+			fmt.Println("objectId is present")
+		}
+	}
+
+	// Output:
+	// 3
+	// encountered an undefined value
+	// <nil>
+	// [1 2]
+	// slice is nil: true
+	// {}
+	// objectId is present
 }
